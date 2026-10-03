@@ -11,6 +11,7 @@
  */
 import Fastify from 'fastify';
 import { config, fixtureOrigin } from './config.js';
+import { matchFault } from './faults.js';
 
 export function buildFixtureApp() {
   const app = Fastify({ logger: { name: 'fixture', level: 'warn' } });
@@ -26,6 +27,9 @@ export function buildFixtureApp() {
     '/sections/weekly',
     '/files%2Fdraft',
     '/chain/7',
+    // 第二个发布版本（v2）演示用：旧页 404 故障注入时，演练会发现 v2 异常
+    '/articles/tech/42-v2',
+    '/articles/123-v2',
   ]);
   const pageTitles = {
     '/articles/tech/42': '科技频道文章 42',
@@ -33,6 +37,8 @@ export function buildFixtureApp() {
     '/sections/weekly': '周刊栏目',
     '/files%2Fdraft': '文件名中带斜杠字符的草稿页（编码斜杠是合法文件名）',
     '/chain/7': '长链终点页',
+    '/articles/tech/42-v2': '科技频道文章 42（v2 改版页）',
+    '/articles/123-v2': '文章 123（v2 改版页）',
   };
 
   /**
@@ -88,6 +94,19 @@ export function buildFixtureApp() {
     const path = u.pathname;       // WHATWG: 保留 %2F 等转义
     const search = u.search;       // 原样透传，含 utm 等追踪参数
     const res = reply.raw;
+
+    // 演练故障注入优先命中（仅本地、仅精确路径；目标仍受白名单约束）
+    const fault = matchFault(path);
+    if (fault) {
+      if (fault.kind === 'redirect') {
+        const loc = new URL(fault.value, fixtureOrigin());
+        return send(res, 302, `drill redirect to ${loc.pathname}${search}`,
+          { 'x-drill-fault': 'redirect', location: loc.pathname + search });
+      }
+      return send(res, fault.value,
+        `${fault.value} drill-injected on ${path}`,
+        { 'x-drill-fault': 'final_status' });
+    }
 
     if (gone.has(path)) {
       return send(res, 410, `410 Gone: 栏目已删除 (${path})`);

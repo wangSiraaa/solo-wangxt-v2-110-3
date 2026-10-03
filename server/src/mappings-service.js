@@ -6,6 +6,7 @@ import { analyzeInputs } from './ambiguity.js';
 
 export async function recomputeMappings(client) {
   const { rows } = await client.query('SELECT * FROM mapping_inputs ORDER BY id');
+  // analyzeInputs 用 WHATWG 规则重算 norm 键（不能直接信任库里的字符串）
   const { groups, ambiguous } = analyzeInputs(rows);
   const conflict = new Set(ambiguous.map((a) => a.source_norm));
   await client.query('TRUNCATE url_mappings RESTART IDENTITY CASCADE');
@@ -15,7 +16,7 @@ export async function recomputeMappings(client) {
       `INSERT INTO url_mappings
          (source_raw, source_norm, target_raw, target_norm, mapping_type, status, note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [first.source_raw, sourceNorm, first.target_raw, first.target_norm,
+      [first.source_raw, sourceNorm, first.target_raw, first.t.normKey,
        first.mapping_type, conflict.has(sourceNorm) ? 'conflicted' : 'active',
        first.note ?? null]);
   }

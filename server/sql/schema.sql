@@ -93,3 +93,138 @@ CREATE TABLE IF NOT EXISTS migration_plan_items (
   evidence        JSONB NOT NULL DEFAULT '{}'::jsonb,
   UNIQUE (plan_id, mapping_id)
 );
+
+-- ===========================================================================
+-- 本地发布版本与回退账本
+--
+-- 纪律：
+--  - 每个可激活版本必须绑定四样“准备时刻冻结”的东西：
+--      1. 精确映射快照（mapping_inputs + url_mappings + 歧义视图，含指纹）
+--      2. 规范化/白名单策略快照（含指纹；白名单本身只读）
+--      3. 一次完整验证运行（verification_runs + 逐跳快照 verification_run_hops）
+--      4. 迁移方案快照（plan + items）
+--  - prepared 后任何一项漂移 => 激活时判失败，版本置 failed，不可再激活；
+--  - 同一时刻至多一个 active（部分唯一索引强制）；
+--  - release_audit 只增不改（触发器禁止 UPDATE/DELETE/TRUNCATE），
+--    activate/rollback 与状态切换在同一事务内原子提交；
+--  - 旧映射、逐跳证据、方案、验证运行一律不删除（快照在 JSONB/run 表中永存）。
+-- ===========================================================================
+
+-- 规范化策略的运行时微调（单行 id=1）。白名单（fixture host/port）不在这里、
+-- 不可通过 API 修改；这里只允许改不触及 SSRF 边界的规则参数。
+CREATE TABLE IF NOT EXISTS policy_overrides (
+  id              INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  overrides       JSONB NOT NULL DEFAULT '{}'::jsonb,
+  policy_version  BIGINT NOT NULL DEFAULT 1,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 完整验证运行：prepare 必须新建一次全量真实请求；历史运行永不删除。
+CREATE TABLE IF NOT EXISTS verification_runs (
+  id              BIGSERIAL PRIMARY KEY,
+  scope           TEXT NOT NULL CHECK (scope IN ('full','single')),
+  source_norm     TEXT,
+  status          TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
+  fixture_origin  TEXT NOT NULL,
+  fixture_mode    TEXT,
+  rules_snapshot  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  -- items: 每个源键一条 {source_norm, source_raw, verdict, issues,
+  --                     final_status, final_url_raw, final_url_norm,
+  --                     hops, tracker_preserved}
+  summary         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at     TIMESTAMPTZ
+);
+
+-- 验证运行的逐跳证据快照：即使 live 表 crawl_results 被后续重验覆盖，
+-- 版本绑定的那次运行的逐跳证据仍然原样保留。
+CREATE TABLE IF NOT EXISTS verification_run_hops (
+  id              BIGSERIAL PRIMARY KEY,
+  run_id          BIGINT NOT NULL REFERENCES verification_runs(id),
+  source_norm     TEXT NOT NULL,
+  hop_index       INT  NOT NULL,
+  hop             JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_hops_run ON verification_run_hops(run_id, source_norm);
+
+CREATE TABLE IF NOT EXISTS release_versions (
+  id                      BIGSERIAL PRIMARY KEY,
+  name                    TEXT NOT NULL UNIQUE,
+  status                  TEXT NOT NULL
+                          CHECK (status IN
+                            ('prepared','active','superseded','rolled_back','failed')),
+  note                    TEXT,
+  plan_id                 BIGINT NOT NULL REFERENCES migration_plans(id),
+
+  -- 回退链：本次激活所取代的版本；回退发生时指向回到的版本
+  replaces_version_id     BIGINT REFERENCES release_versions(id),
+  rolled_back_to          BIGINT REFERENCES release_versions(id),
+
+  -- 四样冻结证据（任何一项在 prepared 后漂移 => 激活拒绝并置 failed）
+  mappings_snapshot       JSONB NOT NULL,
+  mappings_fingerprint    TEXT NOT NULL,
+  rules_snapshot          JSONB NOT NULL,
+  rules_fingerprint       TEXT NOT NULL,
+  plan_snapshot           JSONB NOT NULL,
+  verification_run_id     BIGINT NOT NULL REFERENCES verification_runs(id),
+  verification_fingerprint TEXT NOT NULL,
+
+  failure_reason          JSONB,
+  prepared_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+  activated_at            TIMESTAMPTZ,
+  reactivated_at          TIMESTAMPTZ,
+  rolled_back_at          TIMESTAMPTZ
+);
+-- 数据库级强制：同一时刻只能有一个 active 版本（并发激活也无法插入第二个）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_release_one_active
+  ON release_versions(status) WHERE status = 'active';
+
+-- 不可变审计账本：只允许 INSERT。
+CREATE TABLE IF NOT EXISTS release_audit (
+  id              BIGSERIAL PRIMARY KEY,
+  release_id      BIGINT NOT NULL REFERENCES release_versions(id),
+  action          TEXT NOT NULL
+                  CHECK (action IN
+                    ('prepared','activated','superseded',
+                     'rolled_back','reactivated','failed')),
+  detail          JSONB NOT NULL DEFAULT '{}'::jsonb,
+  occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_release_audit_release ON release_audit(release_id, id);
+
+CREATE OR REPLACE FUNCTION release_audit_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  -- 仅开发期重置（npm run seed / 测试）允许，且必须在同事务显式打开开关
+  IF current_setting('app.ledger_reset', true) = 'on' THEN
+    IF TG_OP = 'TRUNCATE' THEN RETURN NULL; END IF;
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'release_audit 是不可变审计账本，禁止 % 操作', TG_OP;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_release_audit_no_update ON release_audit;
+CREATE TRIGGER trg_release_audit_no_update
+  BEFORE UPDATE OR DELETE ON release_audit
+  FOR EACH ROW EXECUTE FUNCTION release_audit_immutable();
+
+DROP TRIGGER IF EXISTS trg_release_audit_no_truncate ON release_audit;
+CREATE TRIGGER trg_release_audit_no_truncate
+  BEFORE TRUNCATE ON release_audit
+  FOR EACH STATEMENT EXECUTE FUNCTION release_audit_immutable();
+
+-- 本地站点（仅限白名单内）演练记录：每次演练绑定一个版本的映射快照。
+CREATE TABLE IF NOT EXISTS drill_runs (
+  id                      BIGSERIAL PRIMARY KEY,
+  release_id              BIGINT NOT NULL REFERENCES release_versions(id),
+  release_name            TEXT NOT NULL,
+  mappings_fingerprint    TEXT NOT NULL,
+  verdict                 TEXT NOT NULL CHECK (verdict IN ('pass','anomaly')),
+  -- results: [{source_norm, source_raw, expected_norm, verdict, issues,
+  --           final_status, final_url_raw, hops}]
+  results                 JSONB NOT NULL,
+  faults                  JSONB NOT NULL DEFAULT '[]'::jsonb,
+  ran_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_drill_release ON drill_runs(release_id, id);

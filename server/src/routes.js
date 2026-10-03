@@ -1,14 +1,35 @@
-/** REST API：映射录入、规范化试算、验证、迁移方案与发布闸门。 */
+/** REST API：映射录入、规范化试算、验证、迁移方案、发布版本账本与演练。 */
 import { pool } from './db.js';
 import { normalize, carryTrackers, splitQuery } from './normalize.js';
 import { recomputeMappings } from './mappings-service.js';
 import { runVerification, VERDICT_LABEL } from './verify-runner.js';
 import { config } from './config.js';
+import {
+  EDITABLE_RULE_KEYS, rulesSnapshot,
+  updateRules, policyVersion,
+} from './policy.js';
+import * as releases from './releases-service.js';
+import * as drill from './drill-service.js';
 
 export default async function api(app) {
   app.get('/api/health', async () => ({ ok: true, fixture: `127.0.0.1:${config.fixture.port}` }));
 
-  app.get('/api/rules', async () => config.rules);
+  app.get('/api/rules', async () => ({
+    ...rulesSnapshot(),
+    editableKeys: EDITABLE_RULE_KEYS,
+    policyVersion: policyVersion(),
+    allowlistReadonly: true,
+  }));
+
+  // 运行时微调规则（不触及白名单/SSRF 边界）；改动会使所有 prepared 版本过期
+  app.put('/api/rules', async (req, reply) => {
+    try {
+      const result = await updateRules(req.body ?? {});
+      return result;
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({ error: e.message });
+    }
+  });
 
   // 规范化试算（不写库）：展示大小写/编码/尾斜杠/查询参数如何处理
   app.post('/api/normalize', async (req) => {
@@ -71,7 +92,32 @@ export default async function api(app) {
 
   app.post('/api/verify', async (req) => {
     const onlyKey = req.body?.source_norm ?? null;
-    return runVerification({ onlyKey });
+    return runVerification({ onlyKey, recordRun: false });
+  });
+
+  // 撤回一条原始录入（业务裁决/改版时剔除），随后重算生效映射。
+  // 已冻结在发布版本快照中的该录入不受影响、永不删除。
+  app.delete('/api/mappings/inputs/:id', async (req, reply) => {
+    const id = Number(req.params.id);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        'SELECT * FROM mapping_inputs WHERE id=$1 FOR UPDATE', [id]);
+      if (!rows.length) {
+        await client.query('ROLLBACK');
+        return reply.code(404).send({ error: '录入不存在' });
+      }
+      await client.query('DELETE FROM mapping_inputs WHERE id=$1', [id]);
+      await recomputeMappings(client);
+      await client.query('COMMIT');
+      return { ok: true, deleted: id };
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   });
 
   app.get('/api/crawl/:key', async (req, reply) => {
@@ -227,4 +273,100 @@ export default async function api(app) {
         WHERE id=$1 RETURNING *`, [planId]);
     return { published: true, plan: rows[0] };
   });
+
+  // =======================================================================
+  // 本地发布版本账本 / 回退 / 演练
+  // =======================================================================
+
+  // 版本总览：状态、回退目标、prepared 版本是否仍新鲜
+  app.get('/api/releases', async () => releases.listReleases());
+
+  // 当前 active 版本 + 现场是否仍等于冻结映射快照 + 最近演练
+  app.get('/api/releases/active', async () => releases.getActiveRelease());
+
+  // 不可变审计账本
+  app.get('/api/releases/audit', async () => ({ audit: await releases.getAuditTrail() }));
+
+  // 版本详情（含绑定的逐跳证据、相关审计、演练记录）
+  app.get('/api/releases/:id', async (req, reply) => {
+    try {
+      return await releases.getRelease(Number(req.params.id));
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({ error: e.message });
+    }
+  });
+
+  // 与当前 active 的映射/规则差异
+  app.get('/api/releases/:id/diff', async (req, reply) => {
+    try {
+      return await releases.releaseDiff(Number(req.params.id));
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({ error: e.message });
+    }
+  });
+
+  // 准备：冻结映射/规则/完整验证运行/方案四样证据
+  app.post('/api/releases/prepare', async (req, reply) => {
+    try {
+      return await releases.prepareRelease({
+        name: req.body?.name,
+        note: req.body?.note ?? null,
+        planId: req.body?.plan_id ?? null,
+      });
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({
+        error: e.message, blockers: e.blockers ?? undefined,
+        run: e.run ?? undefined,
+      });
+    }
+  });
+
+  // 激活：原子切换；漂移则 409 + 过期证据明细 + 版本置 failed
+  app.post('/api/releases/:id/activate', async (req, reply) => {
+    try {
+      return await releases.activateRelease(Number(req.params.id));
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({
+        error: e.message, stale: e.stale ?? undefined,
+        idempotent: e.idempotent ?? undefined,
+      });
+    }
+  });
+
+  // 回退：原子回到上一 active 版本；重复调用幂等，不产生重复审计
+  app.post('/api/releases/:id/rollback', async (req, reply) => {
+    try {
+      return await releases.rollbackRelease(
+        Number(req.params.id), req.body?.to_version_id ?? null);
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({
+        error: e.message, idempotent: e.idempotent ?? undefined,
+      });
+    }
+  });
+
+  // ---- 本地站点演练（故障注入只作用于白名单本地站点，且不持久化）---------
+
+  app.post('/api/drill/run', async (req, reply) => {
+    try {
+      return await drill.runDrill({ releaseId: req.body?.release_id ?? null });
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({ error: e.message });
+    }
+  });
+
+  app.get('/api/drill/runs', async (req) =>
+    ({ runs: await drill.listDrills({ releaseId: req.query?.release_id ?? null }) }));
+
+  app.get('/api/drill/faults', async () => drill.currentFaults());
+
+  app.post('/api/drill/faults', async (req, reply) => {
+    try {
+      return drill.applyFaults(req.body?.faults ?? []);
+    } catch (e) {
+      return reply.code(e.statusCode ?? 500).send({ error: e.message });
+    }
+  });
+
+  app.delete('/api/drill/faults', async () => drill.removeFaults());
 }

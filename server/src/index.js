@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 import { ensureDatabase, pool } from './db.js';
 import { startFixture } from './fixture.js';
+import { loadPolicy } from './policy.js';
 import apiRoutes from './routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,6 +20,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 async function main() {
   const fixture = await startFixture();
   await ensureDatabase();
+  await loadPolicy();
 
   const app = Fastify({ logger: { name: 'workbench', level: 'info' } });
   await app.register(apiRoutes);

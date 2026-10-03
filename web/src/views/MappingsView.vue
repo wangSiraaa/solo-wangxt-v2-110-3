@@ -61,7 +61,7 @@
   <div class="panel">
     <h2>原始录入材料（mapping_inputs）与生效映射</h2>
     <table>
-      <thead><tr><th>#</th><th>原始旧址</th><th>归一化键</th><th>新址</th><th>类型</th><th>状态</th><th>备注</th></tr></thead>
+      <thead><tr><th>#</th><th>原始旧址</th><th>归一化键</th><th>新址</th><th>类型</th><th>状态</th><th>备注</th><th></th></tr></thead>
       <tbody>
         <tr v-for="i in inputs" :key="i.id">
           <td>{{ i.id }}</td>
@@ -74,6 +74,7 @@
             <span v-else class="badge ok">生效</span>
           </td>
           <td class="small muted">{{ i.note }}</td>
+          <td><a href="#" @click.prevent="remove(i.id)">撤回</a></td>
         </tr>
       </tbody>
     </table>
@@ -119,6 +120,15 @@ async function submit() {
 }
 async function trial() {
   trialResults.value = await api.normalize(trialText.value.split('\n').map((s) => s.trim()).filter(Boolean));
+}
+async function remove(id) {
+  if (!confirm('撤回该条录入？已发布版本快照中的证据不会被删除。')) return;
+  error.value = '';
+  try {
+    await api.deleteMappingInput(id);
+    await load();
+    emit('changed');
+  } catch (e) { error.value = e.message; }
 }
 watch(() => props.refreshKey, load);
 onMounted(load);

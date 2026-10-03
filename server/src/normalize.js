@@ -13,8 +13,11 @@
  *  - fragment 不参与身份。
  */
 import { config } from './config.js';
+import { effectiveRules } from './policy.js';
 
-const TRACKERS = new Set(config.rules.trackerParams);
+// 追踪参数名单来自当前生效策略（可在工作台微调；环境默认见 config.rules）。
+// 每次解析动态读取，使“准备后改规则”能被版本指纹捕获。
+const currentTrackerSet = () => new Set(effectiveRules().trackerParams);
 
 /** 百分号三元组的十六进制位统一大写（%2f -> %2F），其余字节不动 */
 function canonicalizePercentEscapes(str) {
@@ -35,7 +38,7 @@ function normalizePathname(pathname, mode) {
  * 拆分查询串：返回 { identity: [[k,v],...], trackers: Map<k, v[]> }
  * 不做任何解码；'+' 不视为空格；只按 '=' 切一次。
  */
-export function splitQuery(search, trackerSet = TRACKERS) {
+export function splitQuery(search, trackerSet = currentTrackerSet()) {
   const identity = [];
   const trackers = new Map();
   const raw = search.startsWith('?') ? search.slice(1) : search;
@@ -86,7 +89,7 @@ export function normalize(rawInput, opts = {}) {
     return { ok: false, error: `unsupported scheme: ${u.protocol}` };
   }
 
-  const mode = opts.tailSlashMode ?? config.rules.tailSlashMode;
+  const mode = opts.tailSlashMode ?? effectiveRules().tailSlashMode;
   const pathname = normalizePathname(u.pathname, mode);
   const fullPathname = normalizePathname(u.pathname, 'keep');
 

@@ -6,6 +6,7 @@ import { ensureDatabase, pool } from './db.js';
 import { normalize } from './normalize.js';
 import { analyzeInputs } from './ambiguity.js';
 import { fixtureOrigin } from './config.js';
+import { resetRules } from './policy.js';
 
 const O = fixtureOrigin();
 
@@ -84,10 +85,18 @@ const INPUTS = [
 
 export async function seed() {
   await ensureDatabase();
+  await resetRules();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('TRUNCATE migration_plan_items, migration_plans, verification_verdicts, crawl_results, url_mappings, mapping_inputs RESTART IDENTITY');
+    // 开发期重置不可变审计账本：显式打开同事务开关（触发器才放行 TRUNCATE）
+    await client.query("SET LOCAL app.ledger_reset = 'on'");
+    await client.query(
+      `TRUNCATE drill_runs, release_audit, release_versions,
+               verification_run_hops, verification_runs, policy_overrides,
+               migration_plan_items, migration_plans, verification_verdicts,
+               crawl_results, url_mappings, mapping_inputs
+       RESTART IDENTITY CASCADE`);
 
     for (const row of INPUTS) {
       const s = normalize(row.source_raw);

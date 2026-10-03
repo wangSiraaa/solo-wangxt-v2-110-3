@@ -38,16 +38,20 @@ try {
 
   const { total, conflicted } = await recomputeMappings(client);
 
-  // 4) 环已在站点侧打断：修正映射目标为修复后的真实落点
+  // 4) 环已在站点侧打断：把原始录入材料的目标也改成修复后的真实落点，
+  //    再重算生效映射——只改 url_mappings 会在下一次录入/重算时被材料覆盖。
   const loopKey = normalize(`${O}/loop/a`).normKey;
-  const loopTarget = normalize(`${O}/articles/tech/42`);
+  const fixedTarget = `${O}/articles/tech/42`;
+  const fixedTargetNorm = normalize(fixedTarget).normKey;
   await client.query(
-    `UPDATE url_mappings
-        SET target_raw=$2, target_norm=$3, note='环已打断，直跳到科技文章'
+    `UPDATE mapping_inputs
+        SET target_raw=$2, target_norm=$3,
+            note=COALESCE(note,'') || '（环已打断，直跳到科技文章）'
       WHERE source_norm=$1`,
-    [loopKey, `${O}/articles/tech/42`, loopTarget.normKey]);
-  console.log('环修复：/loop/a 的映射目标更新为修复后的真实落点');
-  console.log(`重算生效映射：${total} 条，冲突 ${conflicted} 条`);
+    [loopKey, fixedTarget, fixedTargetNorm]);
+  const { total: total2, conflicted: conflicted2 } = await recomputeMappings(client);
+  console.log('环修复：/loop/a 录入材料与生效映射均更新为修复后的真实落点');
+  console.log(`重算生效映射：${total2} 条，冲突 ${conflicted2} 条`);
   await client.query('COMMIT');
 } catch (e) {
   await client.query('ROLLBACK');

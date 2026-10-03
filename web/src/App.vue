@@ -12,6 +12,7 @@
     <RulesView v-if="tab === 'rules'" />
     <DashboardView v-else-if="tab === 'dash'" />
     <MappingsView v-else-if="tab === 'maps'" :refresh-key="refreshKey" @changed="bump" />
+    <ReleasesView v-else-if="tab === 'releases'" :refresh-key="refreshKey" @changed="bump" />
     <PlansView v-else-if="tab === 'plans'" :refresh-key="refreshKey" />
   </main>
 </template>
@@ -21,10 +22,12 @@ import { ref } from 'vue';
 import RulesView from './views/RulesView.vue';
 import DashboardView from './views/DashboardView.vue';
 import MappingsView from './views/MappingsView.vue';
+import ReleasesView from './views/ReleasesView.vue';
 import PlansView from './views/PlansView.vue';
 
 const tabs = [
   { id: 'dash', label: '验证总览' },
+  { id: 'releases', label: '发布版本 / 回退账本' },
   { id: 'maps', label: '映射与爬取证据' },
   { id: 'plans', label: '迁移方案 / 发布闸门' },
   { id: 'rules', label: '规范化规则' },

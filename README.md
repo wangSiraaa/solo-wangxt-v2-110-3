@@ -24,6 +24,35 @@
 5. **PostgreSQL 保存三类数据**：旧新映射（原始材料 `mapping_inputs` + 生效表
    `url_mappings`）、爬取逐跳结果（`crawl_results`）、迁移方案（`migration_plans`
    / `migration_plan_items`），另存每入口最终裁决 `verification_verdicts`。
+6. **本地发布版本账本与回退**（`release_versions` / `release_audit`）：
+   publish 不是不可逆终点——每个可激活版本必须绑定四样**准备时刻冻结**的证据，
+   prepared 后任何漂移都会阻断激活；激活/回退原子切换当前版本，审计只增不改。
+
+## 本地发布版本与回退账本
+
+激活的是“版本”，不是一次随手 publish。每个版本经历
+`prepared → active → superseded →（异常）rolled_back`，或漂移时 `failed`：
+
+- **四样冻结证据**（prepare 时一次性绑定，各带 SHA-256 指纹）：
+  1. 精确映射快照（`mapping_inputs` + `url_mappings` + 歧义视图，原样 JSONB 永存）；
+  2. 规范化/白名单策略快照（白名单即随项目启动的 `127.0.0.1:4568`，**只读**，
+     规则微调只允许尾斜杠/追踪参数/跳数/超时，改动立即使 prepared 版本过期）；
+  3. 一次**完整验证运行**（`verification_runs` + 逐跳快照 `verification_run_hops`），
+     prepare 会真实重跑全量验证，未全绿就不产生版本，**未完成验证永远不能借旧版本放行**；
+  4. 迁移方案快照（plan + items）。
+- **同一时刻只有一个 active**：数据库部分唯一索引 `ux_release_one_active` 强制，
+  并发激活也无法产生第二个。
+- **激活/回退原子化**：状态切换（active→superseded、目标→active 等）与审计写入
+  在同一事务提交；`release_audit` 有触发器禁止 UPDATE/DELETE/TRUNCATE（不可变账本）。
+- **证据过期即失效**：prepare 后映射、规则或验证结果任何一项变化，激活返回
+  409 并列出**哪条链接的哪类证据过期**，版本置 `failed`，不可再激活。
+- **旧证据永不删除**：旧映射、逐跳证据、方案、验证运行都随版本快照保留；
+  回退后上一 active 恢复，两个版本的证据与演练记录都在。
+- **本地站点演练**：对当前 active 版本**冻结的映射快照**真实请求本地站点；
+  可在白名单内注入故障（最终状态码异常/本地改道，进程内不持久化、重启清空）
+  模拟上线异常，演练记录绑定版本与快照指纹。
+- **幂等**：重复点击激活/回退不会产生两个 active 或重复审计；刷新、重启工作台后
+  当前版本、回退链、失败原因仍从账本正确恢复。
 
 ## 快速开始
 
@@ -36,7 +65,7 @@ npm run pg:start        # 启动 tools/ 下的本地 PostgreSQL（127.0.0.1:5543
 npm run migrate         # 建库 + 建表
 npm run seed            # 写入 10 条演示录入（含全部异常场景）
 
-npm test                # 19 项测试：规范化规则 + 验证器集成（真实启动本地站点）
+npm test                # 27 项测试：规范化 + 验证器 + 发布版本账本全流程（真实本地站点）
 npm run verify          # CLI：对全部映射真实请求验证并给出裁决
 node scripts/report.js  # 产出 docs/verification-report-before.md 风格的证据报告
 
@@ -84,15 +113,41 @@ FIXTURE_MODE=fixed node scripts/report.js
 `build` 时按最新裁决标注 `verified/blocked`；`publish` 时只要存在
 blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 + 受影响链接清单**。
 
+## 版本化发布与回退演练（推荐流程）
+
+```bash
+# 前置：整改 + 全量验证通过（见上）。在“发布版本 / 回退账本”页：
+# 1) 准备 v1：冻结四样证据并跑一次完整验证（任何一条不过就不产生版本）
+curl -X POST localhost:4567/api/releases/prepare -H 'content-type: application/json' \
+  -d '{"name":"v1.0 秋季"}'
+# 2) 激活（prepared 后若映射/规则/验证结果有任何漂移，这里 409 并指明过期证据）
+curl -X POST localhost:4567/api/releases/1/activate
+# 3) 本地站点演练（按 v1 冻结快照逐跳请求 127.0.0.1:4568）
+curl -X POST localhost:4567/api/drill/run
+# 4) 上线演练发现异常：在白名单内注入故障（仅进程内、重启清空），再演练复现
+curl -X POST localhost:4567/api/drill/faults -H 'content-type: application/json' \
+  -d '{"faults":[{"kind":"final_status","path":"/articles/123","value":500}]}'
+# 5) 安全回到上一 active 版本（原子切换；两个版本证据都保留）
+curl -X POST localhost:4567/api/releases/2/rollback
+```
+
 ## API 摘要
 
 | 方法/路径 | 作用 |
 |---|---|
 | `POST /api/normalize` | 规范化试算（不写库） |
-| `GET/POST /api/mappings` | 原始录入材料 / 录入一条（自动重算生效与冲突） |
+| `GET/POST /api/mappings`、`DELETE /api/mappings/inputs/:id` | 原始录入材料 / 录入或撤回一条（自动重算生效与冲突；已冻结快照不受影响） |
 | `POST /api/verify` | 对全部（或指定 `source_norm`）真实验证 |
 | `GET /api/crawl/:key` | 查看某条链接的逐跳证据 |
 | `GET/POST /api/plans`、`POST /api/plans/:id/build`、`POST /api/plans/:id/publish` | 方案与发布闸门 |
+| `GET /api/rules`、`PUT /api/rules` | 规则/白名单快照（白名单只读）；运行时微调规则，prepared 版本随之过期 |
+| `POST /api/releases/prepare` | 全量验证 + 冻结映射/规则/验证运行/方案，创建 prepared 版本 |
+| `GET /api/releases`、`GET /api/releases/active`、`GET /api/releases/:id`、`GET /api/releases/:id/diff` | 账本总览/当前版本（含快照是否仍匹配现场、最近演练）/详情（含逐跳证据）/差异 |
+| `POST /api/releases/:id/activate` | 原子激活；漂移则 409 + 过期证据清单，版本 failed；重复调用幂等 |
+| `POST /api/releases/:id/rollback` | 原子回退到该版本取代的上一 active；重复调用幂等 |
+| `GET /api/releases/audit` | 不可变审计账本（触发器禁止改/删） |
+| `POST /api/drill/run`、`GET /api/drill/runs` | 对 active 版本冻结快照的本地站点演练 |
+| `GET/POST/DELETE /api/drill/faults` | 演练故障注入（仅白名单本地站点、不持久化、目标仍限白名单） |
 
 ## 环境变量（见 `.env.example`）
 
@@ -120,11 +175,14 @@ cd /workspace && npm run pg:start
 
 ```
 server/src/   normalize.js(规范化规则) verifier.js(白名单/环/长链/最终状态)
-              ambiguity.js mappings-service.js verify-runner.js
+              ambiguity.js mappings-service.js verify-runner.js(含完整验证运行)
+              releases-service.js(版本账本/漂移检测/原子激活回退)
+              drill-service.js(本地站点演练) faults.js(白名单内故障注入)
+              policy.js(规则快照/运行时微调；白名单只读) fingerprint.js
               fixture.js(随项目本地站点) routes.js(Fastify) db.js
-server/sql/   schema.sql
-web/          Vue 3 + Vite 工作台（总览/证据/方案闸门/规则四页）
+server/sql/   schema.sql(含 release_versions/release_audit/verification_runs/drill_runs)
+web/          Vue 3 + Vite 工作台（总览/发布版本账本/证据/方案闸门/规则五页）
 scripts/      start-pg.js remediate.js report.js
 docs/         verification-report-before.md / -after.md（真实跑出来的证据）
-server/test/  规则单测 + 验证器集成测试（19 项）
+server/test/  规则单测 + 验证器集成 + 版本账本端到端（27 项）
 ```

@@ -18,9 +18,12 @@
 import http from 'node:http';
 import { config, fixtureOrigin } from './config.js';
 import { normalize, splitQuery } from './normalize.js';
+import { effectiveCrawl } from './policy.js';
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+// 白名单只读：只能访问随项目启动的本地站点（host/port 来自环境配置，
+// policy_overrides 无法触碰）。
 function allowed(u) {
   return (
     u.protocol === 'http:' &&
@@ -33,7 +36,7 @@ function fetchOnce(rawUrl) {
   return new Promise((resolve) => {
     const req = http.get(
       rawUrl,
-      { timeout: config.crawl.timeoutMs, headers: { connection: 'close' } },
+      { timeout: effectiveCrawl().timeoutMs, headers: { connection: 'close' } },
       (res) => {
         res.resume(); // 丢弃响应体，只关心状态与头
         res.on('end', () =>
@@ -75,8 +78,10 @@ export async function crawl(entryRaw) {
   let chainTooLong = false;
   let blocked = false;
 
+  const maxRedirects = effectiveCrawl().maxRedirects;
+
   // 最多发起 maxRedirects+1 次请求（入口 + N 跳）
-  for (let i = 0; i <= config.crawl.maxRedirects; i++) {
+  for (let i = 0; i <= maxRedirects; i++) {
     const curNorm = normalize(currentRaw);
     const key = curNorm.ok ? curNorm.normKey : currentRaw;
     if (seen.has(key)) {
@@ -127,7 +132,7 @@ export async function crawl(entryRaw) {
     }
     currentRaw = locNorm.toString();
 
-    if (i === config.crawl.maxRedirects) {
+    if (i === maxRedirects) {
       chainTooLong = true;
     }
   }
@@ -177,7 +182,7 @@ export function judge(entryRaw, mappingType, expectedTargetNorm) {
       issues.push(`重定向环：${r.loop} 在链中重复`);
     } else if (r.chainTooLong) {
       verdict = 'chain_too_long';
-      issues.push(`跳转链超过上限 ${config.crawl.maxRedirects} 跳仍未终结`);
+      issues.push(`跳转链超过上限 ${effectiveCrawl().maxRedirects} 跳仍未终结`);
     } else if (r.finalStatus == null) {
       verdict = 'fetch_error';
       issues.push('未能取得最终状态码（连接错误/超时）');

@@ -1,4 +1,38 @@
 <template>
+  <div class="panel" v-if="activeInfo">
+    <h2>当前激活版本绑定的映射快照</h2>
+    <div class="callout" :class="activeInfo.live_matches_snapshot ? 'ok' : 'bad'">
+      <div class="row" style="align-items:center">
+        <div style="flex:3">
+          <span class="badge ok">ACTIVE #{{ activeInfo.release.id }}</span>
+          <b style="margin-left:8px">{{ activeInfo.release.name }}</b>
+          <div class="small muted" style="margin-top:6px">
+            本页验证/证据所对照的当前发布映射快照：
+            <code>{{ activeInfo.release.mappings_fingerprint.slice(0, 22) }}…</code>
+            （{{ activeInfo.release.mappings_snapshot.mappings.length }} 条）·
+            绑定完整验证运行 #{{ activeInfo.release.verification_run_id }}
+          </div>
+          <div class="small" style="margin-top:4px"
+               :style="activeInfo.live_matches_snapshot ? 'color:var(--ok)' : 'color:var(--bad)'">
+            {{ activeInfo.live_matches_snapshot
+              ? '现场映射与快照一致：下列裁决即当前版本证据'
+              : '现场映射已偏离当前版本快照！下列 live 裁决不再属于该版本，发布/回退账本以冻结快照为准' }}
+          </div>
+        </div>
+        <div style="flex:1" class="small">
+          <div v-if="activeInfo.latest_drill">
+            最近本地演练：
+            <span :class="activeInfo.latest_drill.verdict === 'pass' ? 'badge ok' : 'badge bad'">
+              {{ activeInfo.latest_drill.verdict === 'pass' ? '通过' : '异常' }}
+            </span>
+            <span class="muted">（同一快照指纹）</span>
+          </div>
+          <div v-else class="muted">尚无本地演练（去“发布版本”页执行）</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="panel">
     <h2>验证总览 —— 真实请求本地站点，逐跳取证</h2>
     <div class="row" style="align-items:center">
@@ -85,6 +119,7 @@ const label = ref({});
 const running = ref(false);
 const hops = ref([]);
 const hopsKey = ref('');
+const activeInfo = ref(null);
 
 const counts = computed(() => {
   const c = { ok: 0, ambiguity: 0, loop: 0, long: 0, badStatus: 0, fetch: 0, unverified: 0 };
@@ -109,6 +144,7 @@ async function load() {
     if (!byKey.has(i.source_norm)) byKey.set(i.source_norm, i);
   }
   rows.value = [...byKey.values()];
+  activeInfo.value = await api.activeRelease().catch(() => null);
 }
 async function runAll() {
   running.value = true;
