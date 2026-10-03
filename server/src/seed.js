@@ -87,7 +87,14 @@ export async function seed() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('TRUNCATE migration_plan_items, migration_plans, verification_verdicts, crawl_results, url_mappings, mapping_inputs RESTART IDENTITY');
+    // 演示重置：release_audit 为 append-only（触发器禁 UPDATE/DELETE/TRUNCATE），
+    // 仅 seed 这种“清空演示库”场景用 replica role 绕过；正式 API 不提供任何删除入口。
+    await client.query('SET session_replication_role = replica');
+    await client.query(`TRUNCATE release_audit, release_drills, release_versions,
+                        verification_runs, migration_plan_items, migration_plans,
+                        verification_verdicts, crawl_results, url_mappings, mapping_inputs
+                        RESTART IDENTITY CASCADE`);
+    await client.query('SET session_replication_role = origin');
 
     for (const row of INPUTS) {
       const s = normalize(row.source_raw);

@@ -37,4 +37,39 @@ export const api = {
     fetch(`/api/plans/${id}/publish`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     }).then(j),
+
+  // 发布版本与回退账本
+  releases: () => fetch('/api/releases').then(j),
+  release: (id) => fetch(`/api/releases/${id}`).then(j),
+  prepareRelease: (planId, name) =>
+    fetch('/api/releases/prepare', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ plan_id: planId, name: name || null }),
+    }).then(j),
+  activateRelease: (id) =>
+    fetch(`/api/releases/${id}/activate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    }).then(j),
+  rollbackRelease: (targetId = null, fromVersion = null) =>
+    fetch('/api/releases/rollback', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(targetId || fromVersion
+        ? { target_id: targetId || null, from_version: fromVersion || null }
+        : {}),
+    }).then(j),
+  drillRelease: (id, kind = 'post_activation') =>
+    fetch(`/api/releases/${id}/drill`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind }),
+    }).then(j),
+  injectFault: (path, status = 500) =>
+    fetch('/api/fixture/fault', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path, status }),
+    }).then(j),
+  clearFaults: () =>
+    fetch('/api/fixture/fault', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: null }),
+    }).then(j),
 };

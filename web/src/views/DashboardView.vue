@@ -1,4 +1,25 @@
 <template>
+  <div class="panel" v-if="active">
+    <h2>当前激活版本绑定的映射快照</h2>
+    <div class="row" style="align-items:center">
+      <div style="flex:2">
+        <span class="badge ok">v{{ active.version_no }} active</span>
+        <span v-if="active.plan_name" class="small muted" style="margin-left:8px">{{ active.plan_name }}</span>
+        <div class="small muted" style="margin-top:4px">
+          本页逐跳证据与「发布版本 / 回退」页的本地演练，
+          都以该版本 prepared 时绑定的<b>映射快照</b>为准。
+        </div>
+      </div>
+      <div style="flex:3" class="small mono">
+        <div>映射快照指纹：{{ active.mapping_fingerprint }}</div>
+        <div>完整验证指纹：{{ active.evidence_fingerprint }}</div>
+        <div v-if="!inSync" class="issues" style="margin-top:4px">
+          ⚠ 当前工作区证据已偏离 active 版本绑定快照（见「发布版本 / 回退」页差异）
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="panel">
     <h2>验证总览 —— 真实请求本地站点，逐跳取证</h2>
     <div class="row" style="align-items:center">
@@ -85,6 +106,8 @@ const label = ref({});
 const running = ref(false);
 const hops = ref([]);
 const hopsKey = ref('');
+const active = ref(null);
+const inSync = ref(true);
 
 const counts = computed(() => {
   const c = { ok: 0, ambiguity: 0, loop: 0, long: 0, badStatus: 0, fetch: 0, unverified: 0 };
@@ -109,6 +132,13 @@ async function load() {
     if (!byKey.has(i.source_norm)) byKey.set(i.source_norm, i);
   }
   rows.value = [...byKey.values()];
+
+  // 当前激活版本与其映射快照指纹（页面必须指出当前映射快照）
+  try {
+    const rs = await api.releases();
+    active.value = rs.active;
+    inSync.value = rs.diff ? rs.diff.evidence_in_sync && rs.diff.mapping_in_sync : true;
+  } catch { active.value = null; }
 }
 async function runAll() {
   running.value = true;

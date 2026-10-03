@@ -93,3 +93,117 @@ CREATE TABLE IF NOT EXISTS migration_plan_items (
   evidence        JSONB NOT NULL DEFAULT '{}'::jsonb,
   UNIQUE (plan_id, mapping_id)
 );
+
+-- =====================================================================
+-- 本地发布版本与回退账本
+--
+-- 一个“可激活版本”绑定四样不可变材料：
+--   1. 精确的映射快照（mapping_inputs + url_mappings 全量内容指纹）
+--   2. 规范化 / 白名单策略快照（config.rules + 验证器白名单指纹）
+--   3. 一次完整验证运行（verification_runs + 逐跳证据，全量、全通过）
+--   4. 迁移方案快照（plan_snapshot JSONB）
+--
+-- 状态机：prepared -> active -> superseded；active 可 rolled_back；
+-- 准备闸门失败 -> failed（终态，永远不能激活，不能借用旧版本放行）。
+-- =====================================================================
+
+-- 完整验证运行（版本绑定的“完整验证”证据，逐跳内容随 JSONB 永久保留；
+-- 即使 crawl_results / verification_verdicts 被后续验证覆盖，这里的证据不变）
+CREATE TABLE IF NOT EXISTS verification_runs (
+  id              BIGSERIAL PRIMARY KEY,
+  started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  total           INT  NOT NULL,
+  passed          INT  NOT NULL,
+  blocked         INT  NOT NULL,
+  -- ok / 空集也算通过：以每条目 verdict ∈ {ok, deleted_gone_ok} 为准
+  results         JSONB NOT NULL DEFAULT '[]'::jsonb,
+  -- 本次运行证据（裁决 + 逐跳）的稳定指纹，不含时间戳；
+-- 证据内容未变则指纹不变，任一跳/裁决变化则指纹变化
+  evidence_hash   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS release_versions (
+  id                    BIGSERIAL PRIMARY KEY,
+  version_no            INT  NOT NULL UNIQUE,
+  name                  TEXT,
+  status                TEXT NOT NULL DEFAULT 'prepared'
+                        CHECK (status IN
+                          ('prepared','active','superseded','rolled_back','failed')),
+  plan_id               BIGINT REFERENCES migration_plans(id),
+  plan_name             TEXT,
+  plan_snapshot         JSONB NOT NULL DEFAULT '{}'::jsonb,  -- 方案条目快照（不可变）
+  verification_run_id   BIGINT REFERENCES verification_runs(id),
+  -- 四样绑定材料的稳定指纹（SHA-256）
+  mapping_fingerprint   TEXT,
+  rules_fingerprint     TEXT,
+  evidence_fingerprint  TEXT,                 -- = verification_runs.evidence_hash
+  verification_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 裁决+逐跳全量快照
+  fixture_mode          TEXT NOT NULL DEFAULT 'default',     -- 绑定的本地站点形态
+  -- 账本关系：
+  --   predecessor       本版本激活时取代的那一版（创建时固定，回退链骨架）
+  --   last_superseded_by 最近一次取代/回退后取代本版本的版本（回退到它的快捷目标）
+  --   superseded_by     与 last_superseded_by 同值（保留列名兼容展示）
+  --   rolled_back_to    本版本被回退时实际恢复的目标
+  predecessor           BIGINT REFERENCES release_versions(id),
+  last_superseded_by    BIGINT REFERENCES release_versions(id),
+  superseded_by         BIGINT REFERENCES release_versions(id),
+  rolled_back_to        BIGINT REFERENCES release_versions(id),
+  failure_reason        JSONB,                -- failed 时的结构化原因（刷新/重启仍可见）
+  prepared_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  activated_at          TIMESTAMPTZ,
+  deactivated_at        TIMESTAMPTZ,
+  ended_at              TIMESTAMPTZ
+);
+-- 同一时刻只能有一个 active 版本（数据库层硬保证，防并发双激活）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_release_one_active
+  ON release_versions((1)) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_release_status ON release_versions(status);
+CREATE INDEX IF NOT EXISTS idx_release_chain ON release_versions(superseded_by);
+
+-- 老库升级：predecessor / last_superseded_by 列（回退链）
+ALTER TABLE release_versions
+  ADD COLUMN IF NOT EXISTS predecessor BIGINT REFERENCES release_versions(id);
+ALTER TABLE release_versions
+  ADD COLUMN IF NOT EXISTS last_superseded_by BIGINT REFERENCES release_versions(id);
+
+-- 上线演练：版本激活后对本地站点真实再跑一遍（结果不可变，只追加）
+CREATE TABLE IF NOT EXISTS release_drills (
+  id              BIGSERIAL PRIMARY KEY,
+  version_id      BIGINT NOT NULL REFERENCES release_versions(id),
+  kind            TEXT NOT NULL DEFAULT 'post_activation'
+                  CHECK (kind IN ('preparation','post_activation','rollback_drill')),
+  ran_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  passed          INT  NOT NULL,
+  failed          INT  NOT NULL,
+  anomaly         BOOLEAN NOT NULL DEFAULT false,
+  results         JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_drills_version ON release_drills(version_id, ran_at);
+
+-- 不可变审计账本：append-only。所有激活/回退/状态切换逐条留痕，
+-- 由触发器拒绝 UPDATE/DELETE/TRUNCATE。
+CREATE TABLE IF NOT EXISTS release_audit (
+  id              BIGSERIAL PRIMARY KEY,
+  at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event           TEXT NOT NULL,                 -- prepared/activated/rolled_back/...
+  from_version    BIGINT,
+  to_version      BIGINT,
+  detail          JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE OR REPLACE FUNCTION release_audit_immutable() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'release_audit 是不可变审计账本，禁止 % 操作', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_release_audit_no_update ON release_audit;
+CREATE TRIGGER trg_release_audit_no_update BEFORE UPDATE ON release_audit
+  FOR EACH ROW EXECUTE FUNCTION release_audit_immutable();
+DROP TRIGGER IF EXISTS trg_release_audit_no_delete ON release_audit;
+CREATE TRIGGER trg_release_audit_no_delete BEFORE DELETE ON release_audit
+  FOR EACH ROW EXECUTE FUNCTION release_audit_immutable();
+DROP TRIGGER IF EXISTS trg_release_audit_no_truncate ON release_audit;
+CREATE TRIGGER trg_release_audit_no_truncate BEFORE TRUNCATE ON release_audit
+  FOR EACH STATEMENT EXECUTE FUNCTION release_audit_immutable();

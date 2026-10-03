@@ -15,6 +15,21 @@ import { config, fixtureOrigin } from './config.js';
 export function buildFixtureApp() {
   const app = Fastify({ logger: { name: 'fixture', level: 'warn' } });
 
+  // 故障注入表：pathname -> 注入状态码；仅存在于进程内存（重启即清除）。
+  // 供“激活后异常 → 回退”上线演练使用；验证器白名单与逐跳纪律不变。
+  const injectedFaults = new Map();
+
+  app.post('/__fixture/fault', async (req) => {
+    const path = req.body?.path ?? null;
+    if (path === null) {
+      injectedFaults.clear();
+      return { ok: true, faults: [] };
+    }
+    const code = Number(req.body?.status ?? 500);
+    injectedFaults.set(String(path), code);
+    return { ok: true, faults: [...injectedFaults.entries()] };
+  });
+
   // FIXTURE_MODE=fixed 模拟“运维按整改单修复旧站配置后”的线上状态：
   // 长链改直跳、环被打断。默认模式保留全部缺陷用于演示检测能力。
   const fixed = process.env.FIXTURE_MODE === 'fixed';
@@ -45,6 +60,8 @@ export function buildFixtureApp() {
     ['/news/123', '/articles/123'],
     ['/column/weekly/', '/sections/weekly'],
     ['/old-files%2Fdraft', '/files%2Fdraft'],
+    // 额外演示入口（供“下一版本新增映射”的发布演练，两种模式行为一致）
+    ['/extra/x', '/articles/tech/42'],
     // 修复模式：长链改直跳、环打断；默认模式保留缺陷
     ...(fixed
       ? [
@@ -79,6 +96,7 @@ export function buildFixtureApp() {
 
   app.addHook('onRequest', (req, reply, done) => {
     const raw = req.raw.url ?? '/';
+    if (raw.startsWith('/__fixture/')) return done(); // 管理面，不进站点行为模拟
     let u;
     try {
       u = new URL(raw, fixtureOrigin());
@@ -88,6 +106,12 @@ export function buildFixtureApp() {
     const path = u.pathname;       // WHATWG: 保留 %2F 等转义
     const search = u.search;       // 原样透传，含 utm 等追踪参数
     const res = reply.raw;
+
+    // 上线演练注入的故障（模拟激活后站点异常）
+    if (injectedFaults.has(path)) {
+      const code = injectedFaults.get(path);
+      return send(res, code, `${code} injected fault (${path})`);
+    }
 
     if (gone.has(path)) {
       return send(res, 410, `410 Gone: 栏目已删除 (${path})`);

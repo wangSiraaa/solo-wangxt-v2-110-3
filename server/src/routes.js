@@ -1,8 +1,12 @@
-/** REST API：映射录入、规范化试算、验证、迁移方案与发布闸门。 */
+/** REST API：映射录入、规范化试算、验证、迁移方案与发布闸门、发布版本与回退账本。 */
 import { pool } from './db.js';
 import { normalize, carryTrackers, splitQuery } from './normalize.js';
 import { recomputeMappings } from './mappings-service.js';
 import { runVerification, VERDICT_LABEL } from './verify-runner.js';
+import {
+  prepareRelease, activateRelease, rollbackRelease, drillRelease,
+  releaseStatus, getRelease,
+} from './release-service.js';
 import { config } from './config.js';
 
 export default async function api(app) {
@@ -226,5 +230,55 @@ export default async function api(app) {
       `UPDATE migration_plans SET status='published', published_at=now()
         WHERE id=$1 RETURNING *`, [planId]);
     return { published: true, plan: rows[0] };
+  });
+
+  // ---- 本地发布版本与回退账本 ----------------------------------------
+
+  // 当前账本：active 版本、与工作区差异、回退目标、审计链
+  app.get('/api/releases', async () => releaseStatus());
+
+  app.get('/api/releases/:id', async (req, reply) => {
+    const r = await getRelease(req.params.id);
+    return reply.code(r.http).send(r.body);
+  });
+
+  // 准备可激活版本（绑定映射/规则/完整验证/方案四样材料）
+  app.post('/api/releases/prepare', async (req, reply) => {
+    const r = await prepareRelease({
+      planId: req.body?.plan_id,
+      name: req.body?.name ?? null,
+    });
+    return reply.code(r.http).send(r.body);
+  });
+
+  // 原子激活：唯一 active；prepared 后任何材料变化都会在此被阻断并说明过期证据
+  app.post('/api/releases/:id/activate', async (req, reply) => {
+    const r = await activateRelease(req.params.id);
+    return reply.code(r.http).send(r.body);
+  });
+
+  // 原子回退：回到上一 active（或指定的历史版本），两版证据都保留
+  app.post('/api/releases/rollback', async (req, reply) => {
+    const r = await rollbackRelease({
+      targetId: req.body?.target_id ?? null,
+      fromVersion: req.body?.from_version ?? null,
+    });
+    return reply.code(r.http).send(r.body);
+  });
+
+  // 上线演练：对版本绑定的映射快照真实请求当前本地站点并比对 prepared 证据
+  app.post('/api/releases/:id/drill', async (req, reply) => {
+    const r = await drillRelease(req.params.id, req.body?.kind ?? 'post_activation');
+    return reply.code(r.http).send(r.body);
+  });
+
+  // 工作台代理的本地站点故障注入（目标固定为随项目启动的白名单站点）
+  app.post('/api/fixture/fault', async (req) => {
+    const res = await fetch(`http://${config.fixture.host}:${config.fixture.port}/__fixture/fault`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: req.body?.path ?? null, status: req.body?.status ?? 500 }),
+    });
+    return res.json();
   });
 }

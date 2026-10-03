@@ -24,6 +24,14 @@
 5. **PostgreSQL 保存三类数据**：旧新映射（原始材料 `mapping_inputs` + 生效表
    `url_mappings`）、爬取逐跳结果（`crawl_results`）、迁移方案（`migration_plans`
    / `migration_plan_items`），另存每入口最终裁决 `verification_verdicts`。
+6. **本地发布版本与回退账本**：每个可激活版本绑定四样不可变材料——精确映射快照、
+   规范化/白名单策略快照、一次完整验证运行（逐跳证据）与迁移方案；
+   版本经历 `prepared → active → superseded / rolled_back / failed`，
+   同时刻只有一个 active（部分唯一索引 + 事务级咨询锁硬保证）。
+   激活/回退在单个事务里原子切换并追加不可变审计（`release_audit` 禁
+   UPDATE/DELETE/TRUNCATE）。prepared 后任何映射、规则或验证结果变化都会使版本
+   在激活时被判定过期、置 failed 并说明是哪项证据过期；未完成验证的版本永远不能
+   激活，也不能借用旧版本放行。回退只恢复已验证过的历史快照，两版证据都保留。
 
 ## 快速开始
 
@@ -36,7 +44,7 @@ npm run pg:start        # 启动 tools/ 下的本地 PostgreSQL（127.0.0.1:5543
 npm run migrate         # 建库 + 建表
 npm run seed            # 写入 10 条演示录入（含全部异常场景）
 
-npm test                # 19 项测试：规范化规则 + 验证器集成（真实启动本地站点）
+npm test                # 30 项测试：规范化 + 验证器（19）+ 发布版本/回退账本 E2E（11）
 npm run verify          # CLI：对全部映射真实请求验证并给出裁决
 node scripts/report.js  # 产出 docs/verification-report-before.md 风格的证据报告
 
@@ -93,6 +101,12 @@ blocked/pending、未纳入的生效映射或未裁决歧义，就返回 **409 +
 | `POST /api/verify` | 对全部（或指定 `source_norm`）真实验证 |
 | `GET /api/crawl/:key` | 查看某条链接的逐跳证据 |
 | `GET/POST /api/plans`、`POST /api/plans/:id/build`、`POST /api/plans/:id/publish` | 方案与发布闸门 |
+| `GET /api/releases` | 发布账本：当前版本、与工作区差异、回退目标、审计链 |
+| `POST /api/releases/prepare` | 跑完整验证并准备版本（绑定四样材料指纹） |
+| `POST /api/releases/:id/activate` | 原子激活（证据过期则 409 并置 failed） |
+| `POST /api/releases/rollback` | 原子回退到前任（或 `target_id` 指定版本） |
+| `POST /api/releases/:id/drill` | 本地站点上线演练：实况与版本绑定证据比对 |
+| `POST /api/fixture/fault` | 在随项目启动的本地站点注入/清除故障（仅演练） |
 
 ## 环境变量（见 `.env.example`）
 
@@ -121,10 +135,24 @@ cd /workspace && npm run pg:start
 ```
 server/src/   normalize.js(规范化规则) verifier.js(白名单/环/长链/最终状态)
               ambiguity.js mappings-service.js verify-runner.js
-              fixture.js(随项目本地站点) routes.js(Fastify) db.js
+              snapshot.js(快照/指纹) release-service.js(版本账本/激活/回退/演练)
+              fixture.js(随项目本地站点，含演练故障注入) routes.js(Fastify) db.js
 server/sql/   schema.sql
-web/          Vue 3 + Vite 工作台（总览/证据/方案闸门/规则四页）
+web/          Vue 3 + Vite 工作台（总览/证据/方案闸门/发布版本/规则五页）
 scripts/      start-pg.js remediate.js report.js
 docs/         verification-report-before.md / -after.md（真实跑出来的证据）
-server/test/  规则单测 + 验证器集成测试（19 项）
+server/test/  规则单测 + 验证器集成 + 发布账本端到端（30 项），入口 run.js 分组运行
 ```
+
+## 发布版本与回退演练（典型流程）
+
+```bash
+npm run seed && FIXTURE_MODE=fixed node scripts/remediate.js && FIXTURE_MODE=fixed npm run verify
+FIXTURE_MODE=fixed npm start            # 工作台 http://127.0.0.1:4567
+# 工作台「发布版本 / 回退」页：
+#   1. 选已 build 且全绿的方案 → “完整验证并准备版本”（得到 prepared 版本）
+#   2. 激活 → 唯一 active；页面与“验证总览”都显示当前映射快照指纹
+#   3. 演练台给本地站点注入故障（如 /articles/tech/42 → 500）→ “上线演练”报异常
+#   4. 原子回退 → 上一 active 恢复；两版逐跳证据与方案均保留，审计链完整
+```
+

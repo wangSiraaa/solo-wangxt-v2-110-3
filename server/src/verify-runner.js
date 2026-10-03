@@ -2,10 +2,14 @@
  * 验证流水线：对每条生效映射真实请求本地站点，
  * 保存每一跳证据（crawl_results）与最终裁决（verification_verdicts）。
  * 冲突键不请求，直接判 ambiguity —— 连请求都不应该开始。
+ *
+ * persistRun=true 时，额外把本次运行写入 verification_runs
+ * （发布版本绑定的“完整验证运行”），并返回证据快照与指纹。
  */
 import { pool } from './db.js';
 import { normalize } from './normalize.js';
 import { judge } from './verifier.js';
+import { buildEvidenceSnapshot, fingerprint } from './snapshot.js';
 
 const VERDICT_LABEL = {
   ok: '通过',
@@ -18,7 +22,9 @@ const VERDICT_LABEL = {
   final_status_bad: '最终页状态异常',
 };
 
-export async function runVerification({ onlyKey = null } = {}) {
+export const GOOD_VERDICTS = new Set(['ok', 'deleted_gone_ok']);
+
+export async function runVerification({ onlyKey = null, persistRun = false } = {}) {
   if (!onlyKey) {
     // 清理已不在 url_mappings 中的旧裁决与爬取证据（映射被剔除后不得残留结论）
     await pool.query(
@@ -81,7 +87,38 @@ export async function runVerification({ onlyKey = null } = {}) {
     });
     results.push({ source_norm: m.source_norm, verdict, issues, hops: crawl.hops.length });
   }
-  return { count: results.length, results, label: VERDICT_LABEL };
+
+  const out = { count: results.length, results, label: VERDICT_LABEL };
+  if (persistRun && !onlyKey) {
+    const snapshot = await currentEvidenceSnapshot();
+    const evidenceHash = fingerprint(snapshot);
+    const passed = snapshot.filter((s) => GOOD_VERDICTS.has(s.verdict)).length;
+    const { rows } = await pool.query(
+      `INSERT INTO verification_runs (total, passed, blocked, results, evidence_hash)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id, started_at, finished_at`,
+      [snapshot.length, passed, snapshot.length - passed,
+       JSON.stringify(results), evidenceHash]);
+    out.runId = rows[0].id;
+    out.evidenceSnapshot = snapshot;
+    out.evidenceHash = evidenceHash;
+    out.passed = passed;
+    out.blocked = snapshot.length - passed;
+  }
+  return out;
+}
+
+/** 读取当前线上证据（verification_verdicts + crawl_results），构造稳定快照。 */
+export async function currentEvidenceSnapshot() {
+  const { rows: verdicts } = await pool.query(
+    'SELECT * FROM verification_verdicts ORDER BY source_norm');
+  const { rows: hops } = await pool.query(
+    'SELECT * FROM crawl_results ORDER BY source_norm, hop_index');
+  const hopsByKey = new Map();
+  for (const h of hops) {
+    if (!hopsByKey.has(h.source_norm)) hopsByKey.set(h.source_norm, []);
+    hopsByKey.get(h.source_norm).push(h);
+  }
+  return buildEvidenceSnapshot({ verdicts, hopsByKey });
 }
 
 async function saveVerdict({ sourceNorm, sourceRaw, verdict, issues, final, hops, tracker }) {
